@@ -17,14 +17,13 @@
 package kafka.coordinator.transaction
 
 import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicBoolean
 
-import kafka.api.KAFKA_2_4_IV1
 import kafka.coordinator.AbstractCoordinatorConcurrencyTest
 import kafka.coordinator.AbstractCoordinatorConcurrencyTest._
 import kafka.coordinator.transaction.TransactionCoordinatorConcurrencyTest._
 import kafka.log.Log
-import kafka.server.{DelayedOperationPurgatory, FetchDataInfo, FetchLogEnd, KafkaConfig, LogOffsetMetadata, MetadataCache}
-import kafka.utils.timer.MockTimer
+import kafka.server.{FetchDataInfo, FetchLogEnd, KafkaConfig, LogOffsetMetadata, MetadataCache}
 import kafka.utils.{Pool, TestUtils}
 import org.apache.kafka.clients.{ClientResponse, NetworkClient}
 import org.apache.kafka.common.internals.Topic.TRANSACTION_STATE_TOPIC_NAME
@@ -35,10 +34,10 @@ import org.apache.kafka.common.requests._
 import org.apache.kafka.common.utils.{LogContext, MockTime, ProducerIdAndEpoch}
 import org.apache.kafka.common.{Node, TopicPartition}
 import org.easymock.{EasyMock, IAnswer}
-import org.junit.Assert._
-import org.junit.{After, Before, Test}
+import org.junit.jupiter.api.Assertions._
+import org.junit.jupiter.api.{AfterEach, BeforeEach, Test}
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import scala.collection.{Map, mutable}
 
 class TransactionCoordinatorConcurrencyTest extends AbstractCoordinatorConcurrencyTest[Transaction] {
@@ -63,7 +62,7 @@ class TransactionCoordinatorConcurrencyTest extends AbstractCoordinatorConcurren
   val producerId = 11
   private var bumpProducerId = false
 
-  @Before
+  @BeforeEach
   override def setUp(): Unit = {
     super.setUp()
 
@@ -72,22 +71,16 @@ class TransactionCoordinatorConcurrencyTest extends AbstractCoordinatorConcurren
       .anyTimes()
     EasyMock.replay(zkClient)
 
-    txnStateManager = new TransactionStateManager(0, zkClient, scheduler, replicaManager, txnConfig, time,
-      new Metrics(), KAFKA_2_4_IV1)
+    txnStateManager = new TransactionStateManager(0, scheduler, replicaManager, txnConfig, time,
+      new Metrics())
+    txnStateManager.startup(() => zkClient.getTopicPartitionCount(TRANSACTION_STATE_TOPIC_NAME).get)
     for (i <- 0 until numPartitions)
       txnStateManager.addLoadedTransactionsToCache(i, coordinatorEpoch, new Pool[String, TransactionMetadata]())
 
-    val pidManager: ProducerIdManager = EasyMock.createNiceMock(classOf[ProducerIdManager])
-    EasyMock.expect(pidManager.generateProducerId())
-      .andAnswer(new IAnswer[Long]() {
-        def answer(): Long = {
-          if (bumpProducerId) producerId + 1 else producerId
-        }
-      })
+    val pidGenerator: ProducerIdManager = EasyMock.createNiceMock(classOf[ProducerIdManager])
+    EasyMock.expect(pidGenerator.generateProducerId())
+      .andAnswer(() => if (bumpProducerId) producerId + 1 else producerId)
       .anyTimes()
-    val txnMarkerPurgatory = new DelayedOperationPurgatory[DelayedTxnMarker]("txn-purgatory-name",
-      new MockTimer,
-      reaperEnabled = false)
     val brokerNode = new Node(0, "host", 10)
     val metadataCache: MetadataCache = EasyMock.createNiceMock(classOf[MetadataCache])
     EasyMock.expect(metadataCache.getPartitionLeaderEndpoint(
@@ -101,27 +94,22 @@ class TransactionCoordinatorConcurrencyTest extends AbstractCoordinatorConcurren
       metadataCache,
       networkClient,
       txnStateManager,
-      txnMarkerPurgatory,
-      time) {
-        override def shutdown(): Unit = {
-          txnMarkerPurgatory.shutdown()
-        }
-    }
+      time)
 
     transactionCoordinator = new TransactionCoordinator(brokerId = 0,
       txnConfig,
       scheduler,
-      pidManager,
+      () => pidGenerator,
       txnStateManager,
       txnMarkerChannelManager,
       time,
       new LogContext)
-    EasyMock.replay(pidManager)
+    EasyMock.replay(pidGenerator)
     EasyMock.replay(metadataCache)
     EasyMock.replay(networkClient)
   }
 
-  @After
+  @AfterEach
   override def tearDown(): Unit = {
     try {
       EasyMock.reset(zkClient, replicaManager)
@@ -129,6 +117,28 @@ class TransactionCoordinatorConcurrencyTest extends AbstractCoordinatorConcurren
     } finally {
       super.tearDown()
     }
+  }
+
+  @Test
+  def testConcurrentGoodPathWithConcurrentPartitionLoading(): Unit = {
+    // This is a somewhat contrived test case which reproduces the bug in KAFKA-9777.
+    // When a new partition needs to be loaded, we acquire the write lock in order to
+    // add the partition to the set of loading partitions. We should still be able to
+    // make progress with transactions even while this is ongoing.
+
+    val keepRunning = new AtomicBoolean(true)
+    val t = new Thread() {
+      override def run(): Unit = {
+        while (keepRunning.get()) {
+          txnStateManager.addLoadingPartition(numPartitions + 1, coordinatorEpoch)
+        }
+      }
+    }
+    t.start()
+
+    verifyConcurrentOperations(createTransactions, allOperations)
+    keepRunning.set(false)
+    t.join()
   }
 
   @Test
@@ -179,7 +189,7 @@ class TransactionCoordinatorConcurrencyTest extends AbstractCoordinatorConcurren
     bumpProducerId = true
     transactions.foreach { txn =>
       val txnMetadata = prepareExhaustedEpochTxnMetadata(txn)
-      txnStateManager.putTransactionStateIfNotExists(txn.transactionalId, txnMetadata)
+      txnStateManager.putTransactionStateIfNotExists(txnMetadata)
 
       // Test simultaneous requests from an existing producer trying to bump the epoch and a new producer initializing
       val newProducerOp1 = new InitProducerIdOperation()
@@ -296,7 +306,7 @@ class TransactionCoordinatorConcurrencyTest extends AbstractCoordinatorConcurren
     bumpProducerId = true
     transactions.foreach { txn =>
       val txnMetadata = prepareExhaustedEpochTxnMetadata(txn)
-      txnStateManager.putTransactionStateIfNotExists(txn.transactionalId, txnMetadata)
+      txnStateManager.putTransactionStateIfNotExists(txnMetadata)
 
       // Test simultaneous requests from an existing producer attempting to bump the epoch and a new producer initializing
       val bumpEpochOp = new InitProducerIdOperation(Some(new ProducerIdAndEpoch(producerId, (Short.MaxValue - 1).toShort)))
@@ -332,7 +342,7 @@ class TransactionCoordinatorConcurrencyTest extends AbstractCoordinatorConcurren
     bumpProducerId = true
     transactions.foreach { txn =>
       val txnMetadata = prepareExhaustedEpochTxnMetadata(txn)
-      txnStateManager.putTransactionStateIfNotExists(txn.transactionalId, txnMetadata)
+      txnStateManager.putTransactionStateIfNotExists(txnMetadata)
 
       val bumpEpochReq = new InitProducerIdOperation(Some(new ProducerIdAndEpoch(producerId, (Short.MaxValue - 1).toShort)))
       bumpEpochReq.run(txn)
@@ -409,7 +419,7 @@ class TransactionCoordinatorConcurrencyTest extends AbstractCoordinatorConcurren
       enableCompletion()
       transactionMetadata(txn)
     })(metadata => metadata.nonEmpty && metadata.forall(m => m.state == expectedState && m.pendingState.isEmpty))
-    assertTrue(s"Invalid metadata state $metadata", success)
+    assertTrue(success, s"Invalid metadata state $metadata")
   }
 
   private def transactionMetadata(txn: Transaction): Option[TransactionMetadata] = {
@@ -500,6 +510,7 @@ class TransactionCoordinatorConcurrencyTest extends AbstractCoordinatorConcurren
   class InitProducerIdOperation(val producerIdAndEpoch: Option[ProducerIdAndEpoch] = None) extends TxnOperation[InitProducerIdResult] {
     override def run(txn: Transaction): Unit = {
       transactionCoordinator.handleInitProducerId(txn.transactionalId, 60000, producerIdAndEpoch, resultCallback)
+      replicaManager.tryCompleteActions()
     }
     override def awaitAndVerify(txn: Transaction): Unit = {
       val initPidResult = result.getOrElse(throw new IllegalStateException("InitProducerId has not completed"))
@@ -516,6 +527,7 @@ class TransactionCoordinatorConcurrencyTest extends AbstractCoordinatorConcurren
             txnMetadata.producerEpoch,
             partitions,
             resultCallback)
+        replicaManager.tryCompleteActions()
       }
     }
     override def awaitAndVerify(txn: Transaction): Unit = {
@@ -556,7 +568,7 @@ class TransactionCoordinatorConcurrencyTest extends AbstractCoordinatorConcurren
 
   class LoadTxnPartitionAction(txnTopicPartitionId: Int) extends Action {
     override def run(): Unit = {
-      transactionCoordinator.handleTxnImmigration(txnTopicPartitionId, coordinatorEpoch)
+      transactionCoordinator.onElection(txnTopicPartitionId, coordinatorEpoch)
     }
     override def await(): Unit = {
       allTransactions.foreach { txn =>
@@ -570,12 +582,12 @@ class TransactionCoordinatorConcurrencyTest extends AbstractCoordinatorConcurren
   class UnloadTxnPartitionAction(txnTopicPartitionId: Int) extends Action {
     val txnRecords: mutable.ArrayBuffer[SimpleRecord] = mutable.ArrayBuffer[SimpleRecord]()
     override def run(): Unit = {
-      transactionCoordinator.handleTxnEmigration(txnTopicPartitionId, coordinatorEpoch)
+      transactionCoordinator.onResignation(txnTopicPartitionId, Some(coordinatorEpoch))
     }
     override def await(): Unit = {
       allTransactions.foreach { txn =>
         if (txnStateManager.partitionFor(txn.transactionalId) == txnTopicPartitionId)
-          assertTrue("Transaction metadata not removed", transactionMetadata(txn).isEmpty)
+          assertTrue(transactionMetadata(txn).isEmpty, "Transaction metadata not removed")
       }
     }
   }
@@ -588,15 +600,16 @@ class TransactionCoordinatorConcurrencyTest extends AbstractCoordinatorConcurren
         }
       }
       txnStateManager.enableTransactionalIdExpiration()
+      replicaManager.tryCompleteActions()
       time.sleep(txnConfig.removeExpiredTransactionalIdsIntervalMs + 1)
     }
 
     override def await(): Unit = {
       val (_, success) = TestUtils.computeUntilTrue({
-        replicaManager.tryCompleteDelayedRequests()
+        replicaManager.tryCompleteActions()
         transactions.forall(txn => transactionMetadata(txn).isEmpty)
       })(identity)
-      assertTrue("Transaction not expired", success)
+      assertTrue(success, "Transaction not expired")
     }
   }
 }

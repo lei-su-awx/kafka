@@ -22,7 +22,9 @@ import org.easymock.EasyMock;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
+import org.junit.runner.RunWith;
 import org.powermock.api.easymock.PowerMock;
+import org.powermock.modules.junit4.PowerMockRunner;
 
 import java.io.File;
 import java.io.IOException;
@@ -30,9 +32,13 @@ import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ThreadPoolExecutor;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
 
+@RunWith(PowerMockRunner.class)
 public class FileOffsetBackingStoreTest {
 
     FileOffsetBackingStore store;
@@ -41,6 +47,8 @@ public class FileOffsetBackingStoreTest {
     File tempFile;
 
     private static Map<ByteBuffer, ByteBuffer> firstSet = new HashMap<>();
+    private static final Runnable EMPTY_RUNNABLE = () -> {
+    };
 
     static {
         firstSet.put(buffer("key"), buffer("value"));
@@ -52,7 +60,7 @@ public class FileOffsetBackingStoreTest {
     public void setup() throws IOException {
         store = new FileOffsetBackingStore();
         tempFile = File.createTempFile("fileoffsetbackingstore", null);
-        props = new HashMap<String, String>();
+        props = new HashMap<>();
         props.put(StandaloneConfig.OFFSET_STORAGE_FILE_FILENAME_CONFIG, tempFile.getAbsolutePath());
         props.put(StandaloneConfig.KEY_CONVERTER_CLASS_CONFIG, "org.apache.kafka.connect.json.JsonConverter");
         props.put(StandaloneConfig.VALUE_CONVERTER_CLASS_CONFIG, "org.apache.kafka.connect.json.JsonConverter");
@@ -77,7 +85,7 @@ public class FileOffsetBackingStoreTest {
 
         Map<ByteBuffer, ByteBuffer> values = store.get(Arrays.asList(buffer("key"), buffer("bad"))).get();
         assertEquals(buffer("value"), values.get(buffer("key")));
-        assertEquals(null, values.get(buffer("bad")));
+        assertNull(values.get(buffer("bad")));
 
         PowerMock.verifyAll();
     }
@@ -98,6 +106,12 @@ public class FileOffsetBackingStoreTest {
         assertEquals(buffer("value"), values.get(buffer("key")));
 
         PowerMock.verifyAll();
+    }
+
+    @Test
+    public void testThreadName() {
+        assertTrue(((ThreadPoolExecutor) store.executor).getThreadFactory()
+                .newThread(EMPTY_RUNNABLE).getName().startsWith(FileOffsetBackingStore.class.getSimpleName()));
     }
 
     private static ByteBuffer buffer(String v) {
