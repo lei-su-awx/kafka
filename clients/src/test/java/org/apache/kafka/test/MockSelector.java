@@ -16,9 +16,9 @@
  */
 package org.apache.kafka.test;
 
+import org.apache.kafka.common.errors.AuthenticationException;
 import org.apache.kafka.common.network.ChannelState;
 import org.apache.kafka.common.network.NetworkReceive;
-import org.apache.kafka.common.network.NetworkSend;
 import org.apache.kafka.common.network.Selectable;
 import org.apache.kafka.common.network.Send;
 import org.apache.kafka.common.requests.ByteBufferChannel;
@@ -32,6 +32,7 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Predicate;
 
 /**
  * A fake selector to use for testing
@@ -46,14 +47,22 @@ public class MockSelector implements Selectable {
     private final Map<String, ChannelState> disconnected = new HashMap<>();
     private final List<String> connected = new ArrayList<>();
     private final List<DelayedReceive> delayedReceives = new ArrayList<>();
+    private final Predicate<InetSocketAddress> canConnect;
 
     public MockSelector(Time time) {
+        this(time, null);
+    }
+
+    public MockSelector(Time time, Predicate<InetSocketAddress> canConnect) {
         this.time = time;
+        this.canConnect = canConnect;
     }
 
     @Override
     public void connect(String id, InetSocketAddress address, int sendBufferSize, int receiveBufferSize) throws IOException {
-        this.connected.add(id);
+        if (canConnect == null || canConnect.test(address)) {
+            this.connected.add(id);
+        }
     }
 
     @Override
@@ -88,13 +97,15 @@ public class MockSelector implements Selectable {
         close(id);
     }
 
+    public void serverAuthenticationFailed(String id) {
+        ChannelState authFailed = new ChannelState(ChannelState.State.AUTHENTICATION_FAILED,
+                new AuthenticationException("Authentication failed"), null);
+        this.disconnected.put(id, authFailed);
+        close(id);
+    }
+
     private void removeSendsForNode(String id, Collection<Send> sends) {
-        Iterator<Send> iter = sends.iterator();
-        while (iter.hasNext()) {
-            Send send = iter.next();
-            if (id.equals(send.destination()))
-                iter.remove();
-        }
+        sends.removeIf(send -> id.equals(send.destination()));
     }
 
     public void clear() {
@@ -151,10 +162,6 @@ public class MockSelector implements Selectable {
     @Override
     public List<Send> completedSends() {
         return completedSends;
-    }
-
-    public void completeSend(NetworkSend send) {
-        this.completedSends.add(send);
     }
 
     public List<ByteBufferChannel> completedSendBuffers() {

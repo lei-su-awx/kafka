@@ -27,6 +27,7 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.AuthorizationException;
 import org.apache.kafka.common.errors.ProducerFencedException;
 import org.apache.kafka.common.errors.TimeoutException;
+import org.apache.kafka.common.errors.UnknownProducerIdException;
 import org.apache.kafka.common.errors.WakeupException;
 import org.apache.kafka.common.metrics.Sensor;
 import org.apache.kafka.common.metrics.stats.Avg;
@@ -71,7 +72,6 @@ import static org.apache.kafka.streams.kstream.internals.metrics.Sensors.recordL
  */
 public class StreamTask extends AbstractTask implements ProcessorNodePunctuator {
 
-    private static final ConsumerRecord<Object, Object> DUMMY_RECORD = new ConsumerRecord<>(ProcessorContextImpl.NONEXIST_TOPIC, -1, -1L, null, null);
     // visible for testing
     static final byte LATEST_MAGIC_BYTE = 1;
 
@@ -302,7 +302,7 @@ public class StreamTask extends AbstractTask implements ProcessorNodePunctuator 
                 final long committedTimestamp = decodeTimestamp(metadata.metadata());
                 partitionGroup.setPartitionTime(partition, committedTimestamp);
                 log.debug("A committed timestamp was detected: setting the partition time of partition {}"
-                    + " to {} in stream task {}", partition, committedTimestamp, this);
+                    + " to {} in stream task {}", partition, committedTimestamp, id);
             } else {
                 log.debug("No committed timestamp was found in metadata for partition {}", partition);
             }
@@ -337,8 +337,8 @@ public class StreamTask extends AbstractTask implements ProcessorNodePunctuator 
         if (eosEnabled) {
             try {
                 this.producer.beginTransaction();
-            } catch (final ProducerFencedException fatal) {
-                throw new TaskMigratedException(this, fatal);
+            } catch (final ProducerFencedException | UnknownProducerIdException e) {
+                throw new TaskMigratedException(this, e);
             }
             transactionInFlight = true;
         }
@@ -381,7 +381,7 @@ public class StreamTask extends AbstractTask implements ProcessorNodePunctuator 
      * An active task is processable if its buffer contains data for all of its input
      * source topic partitions, or if it is enforced to be processable
      */
-    boolean isProcessable(final long now) {
+    public boolean isProcessable(final long now) {
         if (partitionGroup.allPartitionsBuffered()) {
             idleStartTime = RecordQueue.UNKNOWN;
             return true;
@@ -397,6 +397,9 @@ public class StreamTask extends AbstractTask implements ProcessorNodePunctuator 
                 return false;
             }
         } else {
+            // there's no data in any of the topics; we should reset the enforced
+            // processing timer
+            idleStartTime = RecordQueue.UNKNOWN;
             return false;
         }
     }
@@ -438,8 +441,8 @@ public class StreamTask extends AbstractTask implements ProcessorNodePunctuator 
             if (recordInfo.queue().size() == maxBufferedSize) {
                 consumer.resume(singleton(partition));
             }
-        } catch (final ProducerFencedException fatal) {
-            throw new TaskMigratedException(this, fatal);
+        } catch (final RecoverableClientException e) {
+            throw new TaskMigratedException(this, e);
         } catch (final KafkaException e) {
             final String stackTrace = getStacktraceString(e);
             throw new StreamsException(format("Exception caught in process. taskId=%s, " +
@@ -480,7 +483,8 @@ public class StreamTask extends AbstractTask implements ProcessorNodePunctuator 
             throw new IllegalStateException(String.format("%sCurrent node is not null", logPrefix));
         }
 
-        updateProcessorContext(new StampedRecord(DUMMY_RECORD, timestamp), node);
+        updateProcessorContext(new StampedRecord(new ConsumerRecord<>(ProcessorContextImpl.NONEXIST_TOPIC, -1, -1L, null, null),
+            timestamp), node);
 
         if (log.isTraceEnabled()) {
             log.trace("Punctuating processor {} with timestamp {} and punctuation type {}", node.name(), timestamp, type);
@@ -488,8 +492,8 @@ public class StreamTask extends AbstractTask implements ProcessorNodePunctuator 
 
         try {
             node.punctuate(timestamp, punctuator);
-        } catch (final ProducerFencedException fatal) {
-            throw new TaskMigratedException(this, fatal);
+        } catch (final RecoverableClientException e) {
+            throw new TaskMigratedException(this, e);
         } catch (final KafkaException e) {
             throw new StreamsException(String.format("%sException caught while punctuating processor '%s'", logPrefix, node.name()), e);
         } finally {
@@ -558,7 +562,7 @@ public class StreamTask extends AbstractTask implements ProcessorNodePunctuator 
             } else {
                 consumer.commitSync(consumedOffsetsAndMetadata);
             }
-        } catch (final CommitFailedException | ProducerFencedException error) {
+        } catch (final CommitFailedException | ProducerFencedException | UnknownProducerIdException error) {
             throw new TaskMigratedException(this, error);
         }
 
@@ -581,8 +585,8 @@ public class StreamTask extends AbstractTask implements ProcessorNodePunctuator 
         super.flushState();
         try {
             recordCollector.flush();
-        } catch (final ProducerFencedException fatal) {
-            throw new TaskMigratedException(this, fatal);
+        } catch (final RecoverableClientException e) {
+            throw new TaskMigratedException(this, e);
         }
     }
 
@@ -664,7 +668,7 @@ public class StreamTask extends AbstractTask implements ProcessorNodePunctuator 
 
                     try {
                         recordCollector.close();
-                    } catch (final ProducerFencedException e) {
+                    } catch (final RecoverableClientException e) {
                         taskMigratedException = new TaskMigratedException(this, e);
                     } finally {
                         producer = null;
@@ -999,5 +1003,9 @@ public class StreamTask extends AbstractTask implements ProcessorNodePunctuator 
             partitionTimes.put(partition, partitionTime(partition));
         }
         return partitionTimes;
+    }
+
+    public boolean hasRecordsQueued() {
+        return numBuffered() > 0;
     }
 }
